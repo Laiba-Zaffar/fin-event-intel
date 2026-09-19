@@ -3,4 +3,7 @@ __pycache__/
 .venv/
 venv/
 data/raw/*.db
+data/raw/*.db-journal
+data/raw/*.db-wal
+data/raw/*.db-shm
 .env

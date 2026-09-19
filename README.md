@@ -9,8 +9,9 @@ production-grade latency.
 - [x] M0 — repo scaffold
 - [x] M1 — RSS news ingestion → SQLite
 - [x] M2 — NER (companies/tickers)
-- [ ] M3 — event classification (zero-shot → fine-tuned FinBERT)
-- [ ] M4 — FastAPI serving + latency benchmarks
+- [x] M3 — event classification (zero-shot baseline)
+- [ ] M4 — FastAPI serving + latency optimization
+- [ ] M3b — fine-tune on labeled data (if zero-shot proves insufficient)
 - [ ] M5 — streaming layer (Redis Streams)
 - [ ] M6 — portfolio polish
 
@@ -30,6 +31,7 @@ production-grade latency.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu  # CPU-only build; skip default index or it pulls the CUDA build (multi-GB)
 pip install -r requirements.txt
 ```
 
@@ -50,3 +52,25 @@ python -m src.nlp.extract_entities
 
 Runs NER over unprocessed articles, resolves company mentions to tickers
 where possible, and stores results in the `entities` table.
+
+```bash
+python -m src.nlp.classify_events
+```
+
+Zero-shot classifies each unclassified article into one of the labels in
+`src/nlp/event_labels.py`, using `valhalla/distilbart-mnli-12-3`. Stores
+label + confidence directly on the `articles` row.
+
+## Known limitations (M3)
+
+- CPU latency is currently ~5s mean per article (up to 14s) — nowhere near
+  production real-time requirements. This is the explicit target for M4
+  (batching, ONNX export, a smaller/distilled model, or GPU).
+- ~40% of articles land in "other" — a lot of feed content (general macro
+  explainers, policy news unrelated to a specific company) doesn't fit the
+  event taxonomy at all, which is expected, not a bug.
+- Confidence scores look informative on a quick eyeball (high-confidence
+  picks are qualitatively correct, e.g. leadership changes; low-confidence
+  picks are genuinely ambiguous headlines) but haven't been validated
+  against real labels yet — that's what a hand-labeled eval set would give
+  us, which ties into Project 2's calibration work later.
