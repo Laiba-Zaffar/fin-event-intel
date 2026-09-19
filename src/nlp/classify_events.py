@@ -3,46 +3,45 @@ import sys
 import time
 from pathlib import Path
 
-from transformers import pipeline
-
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from src.nlp.event_labels import EVENT_LABELS
+from src.nlp.model import build_classifier
 from src.storage.db import get_connection, get_unclassified_articles, store_classification
 
-MODEL_NAME = "valhalla/distilbart-mnli-12-3"
+BATCH_SIZE = 8
 
 
 def run_once() -> None:
-    classifier = pipeline("zero-shot-classification", model=MODEL_NAME)
-
     conn = get_connection()
     articles = get_unclassified_articles(conn)
-    latencies_ms = []
 
-    for article in articles:
-        text = f"{article['title']} {article['summary'] or ''}".strip()
+    if not articles:
+        print("No unclassified articles found.")
+        conn.close()
+        return
 
-        start = time.perf_counter()
-        result = classifier(text, candidate_labels=EVENT_LABELS)
-        latencies_ms.append((time.perf_counter() - start) * 1000)
+    classifier = build_classifier(quantized=False)
+    texts = [f"{a['title']} {a['summary'] or ''}".strip() for a in articles]
 
-        top_label = result["labels"][0]
-        top_score = result["scores"][0]
-        store_classification(conn, article["id"], top_label, top_score)
+    start = time.perf_counter()
+    results = classifier(texts, candidate_labels=EVENT_LABELS, batch_size=BATCH_SIZE)
+    total_ms = (time.perf_counter() - start) * 1000
+
+    if isinstance(results, dict):  # pipeline returns a single dict for one input
+        results = [results]
+
+    for article, result in zip(articles, results):
+        store_classification(conn, article["id"], result["labels"][0], result["scores"][0])
 
     conn.commit()
     conn.close()
 
-    if latencies_ms:
-        print(
-            f"Classified {len(articles)} articles using {MODEL_NAME}.\n"
-            f"Latency (ms) — mean: {statistics.mean(latencies_ms):.1f}, "
-            f"p50: {statistics.median(latencies_ms):.1f}, "
-            f"max: {max(latencies_ms):.1f}"
-        )
-    else:
-        print("No unclassified articles found.")
+    per_article_ms = total_ms / len(articles)
+    print(
+        f"Classified {len(articles)} articles (fp32 model, batch_size={BATCH_SIZE}).\n"
+        f"Total: {total_ms / 1000:.1f}s, avg per article: {per_article_ms:.0f}ms"
+    )
 
 
 if __name__ == "__main__":
