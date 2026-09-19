@@ -10,8 +10,8 @@ production-grade latency.
 - [x] M1 — RSS news ingestion → SQLite
 - [x] M2 — NER (companies/tickers)
 - [x] M3 — event classification (zero-shot baseline)
-- [x] M4a — latency optimization (quantization + batching)
-- [ ] M4b — FastAPI serving layer + request-level p50/p99 benchmarks
+- [x] M4a — latency optimization (quantization attempt, reverted; batching kept)
+- [x] M4b — FastAPI serving layer + request-level p50/p99 benchmarks
 - [ ] M3b — fine-tune on labeled data (if zero-shot proves insufficient)
 - [ ] M5 — streaming layer (Redis Streams)
 - [ ] M6 — portfolio polish
@@ -133,3 +133,38 @@ Caveats:
   export (which has more mature quantization support for seq2seq models
   than raw PyTorch dynamic quantization), or a fine-tuned single-pass
   classifier (M3b) that doesn't pay the per-label NLI cost at all.
+
+## M4b — FastAPI serving layer
+
+Wrapped the classifier in an actual HTTP service (`src/api/main.py`) with
+three endpoints: `GET /health`, `POST /classify` (one article), and
+`POST /classify_batch` (many articles, one forward pass per label across
+the whole batch). The model loads once at app startup via FastAPI's
+`lifespan` context manager, not per-request — reloading a ~1.3GB model on
+every call is the single most common way to accidentally 100x your
+latency, and startup-time loading is the actual fix, not a detail.
+
+Ran the server locally and hit it with a real client
+(`src/api/benchmark_api.py`, using `httpx`) over actual HTTP, not just
+in-process function calls - this measures what a real caller would see,
+request/response serialization included:
+
+| Endpoint              | Result (n=10)                          |
+|------------------------|-----------------------------------------|
+| `/classify` (single)   | mean 6.05s, p50 6.17s, p99 7.54s        |
+| `/classify_batch`      | 4.00s/article avg                       |
+
+Single-request latency is worse here than the earlier batch-script
+numbers (~1.1-2.4s/article) because a single `/classify` call gets none
+of the batching benefit - it's one article, one full pass over all 10
+labels, no amortization possible. This is the honest, expected shape of
+the latency/throughput tradeoff: a system taking one article at a time
+as it arrives pays the full per-item cost; a system that can buffer and
+batch pays much less per item but adds a few seconds of queuing delay.
+Which one you want depends on the actual product requirement (is
+"real-time" defined as "under 100ms for one article" or "under 1s
+average across a stream of them?") - that's a question for M5, not
+something to guess at here.
+
+Try it: `uvicorn src.api.main:app --reload` then open
+`http://localhost:8000/docs` for the interactive Swagger UI.

@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "fastapi",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd /home/laiba/Desktop/fin-event-intel && .venv/bin/uvicorn src.api.main:app --host 0.0.0.0 --port 8000"
+      ],
+      "port": 8000
+    }
+  ]
+}
