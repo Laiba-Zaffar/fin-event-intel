@@ -1,8 +1,103 @@
 # Financial News Event Intelligence Engine
 
-Real-time pipeline that ingests financial news, extracts companies/tickers,
-classifies market-moving event types, and serves predictions with
-production-grade latency.
+A pipeline that ingests financial news in near real time, extracts the
+companies/tickers involved, classifies the type of market-moving event,
+and serves predictions over HTTP with measured (not assumed) latency.
+
+Built as a learning project to go deep on the intersection of NLP,
+real-time systems, and the specific engineering discipline financial ML
+demands: every optimization here was checked against correctness before
+being kept, not just benchmarked for speed.
+
+## Highlights
+
+- **Caught a silent correctness regression before shipping it.** INT8
+  dynamic quantization looked like a clean ~2x latency win on paper -
+  direct comparison against a known-answer headline showed it was
+  actually flipping confident, correct predictions into near-random
+  noise. Reverted, documented, moved on. ([details](#m4a--latency-optimization))
+- **Verified a distributed-systems failure mode, not just claimed
+  resilience.** Killed a Redis Streams consumer mid-message on purpose,
+  confirmed the work was stuck via `XPENDING`, then watched a fresh
+  consumer's `XAUTOCLAIM` reclaim and finish it automatically.
+  ([details](#m5--streaming-layer-redis-streams))
+- **Measured the real latency/throughput tradeoff instead of guessing at
+  it.** A single HTTP request to `/classify` costs ~6s (p50); batching
+  the same work brings per-article cost to ~1-4s depending on batch
+  size. Which one matters depends on how "real-time" gets defined for
+  the actual product, and that tradeoff is written up, not hand-waved.
+- **14 fast, deterministic unit tests** covering the parts of the system
+  that don't require an ML model to verify (ticker resolution, DB dedup,
+  entity filtering) - see [Testing](#testing).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    RSS[RSS feeds] --> Fetch[fetch_news.py]
+    Fetch --> DB[(SQLite)]
+    Fetch -- XADD --> Stream[[Redis Stream:\nnew_articles]]
+    Stream -- XREADGROUP --> Consumer[streaming/consumer.py\nNER + classify, one at a time]
+    Consumer --> DB
+    Consumer -- XACK --> Stream
+    DB --> API[FastAPI service\n/classify · /classify_batch]
+    Backfill[extract_entities.py\nclassify_events.py\nbatch backfill / reprocessing] -.-> DB
+```
+
+Two processing paths exist on purpose: the **stream consumer** handles
+new articles as they arrive, one at a time, optimized for low per-item
+latency. The **batch scripts** exist for backfilling history or
+reprocessing after a bug fix (e.g. the M4a quantization revert), and are
+optimized for throughput via batching instead. Same NER/classification
+logic underneath either way (`src/nlp/`).
+
+## Quickstart
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu  # CPU build; skip default index or it pulls the CUDA build (multi-GB)
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+python -m src.reference.fetch_sp500   # one-time: builds the ticker lookup table
+```
+
+**Option A — streaming (real-time path):**
+```bash
+# needs redis-server running locally
+python -m src.ingest.fetch_news             # producer: fetches news, publishes new article ids
+python -m src.streaming.consumer worker-1   # consumer: NER + classification, one article at a time
+```
+
+**Option B — batch (backfill/reprocessing path):**
+```bash
+python -m src.ingest.fetch_news
+python -m src.nlp.extract_entities
+python -m src.nlp.classify_events
+```
+
+**Serve predictions over HTTP:**
+```bash
+uvicorn src.api.main:app --reload
+# open http://localhost:8000/docs for the interactive Swagger UI
+```
+
+## Testing
+
+```bash
+python -m pytest tests/ -v
+```
+
+14 tests, ~7 seconds, no ML inference involved on purpose - they cover
+`company_lookup` (ticker resolution, including a regression test for a
+real case-sensitivity bug found while writing these), `db` (dedup,
+migrations, unprocessed/unclassified queries), and `extract_entities`
+(the ORG-filtering logic, tested against a mocked spaCy output rather
+than the real model, since asserting on a specific model's exact NER
+output would make the test suite fragile to model/version upgrades).
+Classifier correctness itself is checked via the manual fp32-vs-quantized
+comparison described below, not an automated test - that's a fair gap to
+flag, not something to pretend is covered.
 
 ## Roadmap
 
@@ -12,57 +107,36 @@ production-grade latency.
 - [x] M3 — event classification (zero-shot baseline)
 - [x] M4a — latency optimization (quantization attempt, reverted; batching kept)
 - [x] M4b — FastAPI serving layer + request-level p50/p99 benchmarks
-- [ ] M3b — fine-tune on labeled data (if zero-shot proves insufficient)
 - [x] M5 — streaming layer (Redis Streams)
-- [ ] M6 — portfolio polish
+- [x] M6 — portfolio polish (tests, README, this list)
+- [ ] M3b — fine-tune on labeled data (if zero-shot proves insufficient)
 
-## Known limitations (M2)
+## Engineering notes
+
+The rest of this README is the actual build log - what was tried, what
+broke, what got measured, and why decisions were made. Kept intentionally
+unpolished/chronological rather than rewritten as if everything worked
+first try, because the failures and the reasoning around them are the
+part worth showing in an interview.
+
+### M2 — NER limitations
 
 - Ticker resolution is scoped to S&P 500 constituents only — foreign/small-cap
   names (e.g. BYD, CATL) correctly return no ticker rather than a wrong one.
 - `en_core_web_sm` occasionally misdraws entity boundaries on headline-style
-  text (e.g. absorbing trailing words like "Stock Underperforming"), and
-  matching raw ticker symbols directly (e.g. "AMD") introduces rare false
-  positives on short, word-like tickers (e.g. "COO" as the job title, not
-  Cooper Companies). Acceptable for a v1 baseline; revisit if it affects M3
-  classification quality.
+  text (e.g. absorbing trailing words like "Stock Underperforming"). A
+  length-based filter mitigates the worst cases (see `test_extract_entities.py`
+  for the regression test).
+- Matching raw ticker symbols directly (e.g. "AMD") introduces an
+  irreducible ambiguity: an all-caps word that happens to also be a valid
+  ticker (e.g. "COO", the job title) will still resolve as that ticker.
+  Case-sensitivity was tightened during M6 test-writing (lowercase/mixed-case
+  lookalikes no longer match - that part *was* a bug, now fixed and
+  regression-tested), but the all-caps case is a genuine, accepted
+  limitation, not a bug: there's no way to distinguish "COO" the acronym
+  from "COO" the ticker without more context than a single token gives you.
 
-## Setup
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu  # CPU-only build; skip default index or it pulls the CUDA build (multi-GB)
-pip install -r requirements.txt
-```
-
-## Usage
-
-```bash
-python -m src.ingest.fetch_news
-```
-
-Pulls the configured RSS feeds once and stores new articles in
-`data/raw/news.db` (deduped by link).
-
-```bash
-python -m spacy download en_core_web_sm   # one-time
-python -m src.reference.fetch_sp500       # one-time, builds ticker lookup
-python -m src.nlp.extract_entities
-```
-
-Runs NER over unprocessed articles, resolves company mentions to tickers
-where possible, and stores results in the `entities` table.
-
-```bash
-python -m src.nlp.classify_events
-```
-
-Zero-shot classifies each unclassified article into one of the labels in
-`src/nlp/event_labels.py`, using `valhalla/distilbart-mnli-12-3`. Stores
-label + confidence directly on the `articles` row.
-
-## Known limitations (M3)
+### M3 — event classification limitations
 
 - ~40% of articles land in "other" — a lot of feed content (general macro
   explainers, policy news unrelated to a specific company) doesn't fit the
@@ -73,7 +147,7 @@ label + confidence directly on the `articles` row.
   against real labels yet — that's what a hand-labeled eval set would give
   us, which ties into Project 2's calibration work later.
 
-## M4a — latency optimization
+### M4a — latency optimization
 
 Diagnosis first: zero-shot NLI classification runs one forward pass *per
 candidate label* (it's testing "does this text entail label X" for each
@@ -134,7 +208,7 @@ Caveats:
   than raw PyTorch dynamic quantization), or a fine-tuned single-pass
   classifier (M3b) that doesn't pay the per-label NLI cost at all.
 
-## M4b — FastAPI serving layer
+### M4b — FastAPI serving layer
 
 Wrapped the classifier in an actual HTTP service (`src/api/main.py`) with
 three endpoints: `GET /health`, `POST /classify` (one article), and
@@ -166,10 +240,7 @@ Which one you want depends on the actual product requirement (is
 average across a stream of them?") - that's a question for M5, not
 something to guess at here.
 
-Try it: `uvicorn src.api.main:app --reload` then open
-`http://localhost:8000/docs` for the interactive Swagger UI.
-
-## M5 — streaming layer (Redis Streams)
+### M5 — streaming layer (Redis Streams)
 
 Until now, `fetch_news.py` wrote to SQLite and `extract_entities.py` /
 `classify_events.py` separately polled it for unprocessed rows - a
@@ -203,12 +274,6 @@ This is exactly the failure mode a poll-the-database design can't handle
 cleanly without a lot of bespoke locking/retry logic, and it's the kind
 of reliability property the JD's "data integrity" language is pointing
 at, not just "does the model work on the happy path."
-
-Run it (needs `redis-server` running locally):
-```bash
-python -m src.ingest.fetch_news        # producer: publishes new article ids
-python -m src.streaming.consumer worker-1   # consumer: processes them
-```
 
 Known limitations:
 - `XACK` removes a message from the pending list, not from the stream
