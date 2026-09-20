@@ -13,7 +13,7 @@ production-grade latency.
 - [x] M4a — latency optimization (quantization attempt, reverted; batching kept)
 - [x] M4b — FastAPI serving layer + request-level p50/p99 benchmarks
 - [ ] M3b — fine-tune on labeled data (if zero-shot proves insufficient)
-- [ ] M5 — streaming layer (Redis Streams)
+- [x] M5 — streaming layer (Redis Streams)
 - [ ] M6 — portfolio polish
 
 ## Known limitations (M2)
@@ -168,3 +168,59 @@ something to guess at here.
 
 Try it: `uvicorn src.api.main:app --reload` then open
 `http://localhost:8000/docs` for the interactive Swagger UI.
+
+## M5 — streaming layer (Redis Streams)
+
+Until now, `fetch_news.py` wrote to SQLite and `extract_entities.py` /
+`classify_events.py` separately polled it for unprocessed rows - a
+workable batch pipeline, but not how a "real-time event intelligence"
+system should be shaped. M5 decouples ingestion from processing with a
+Redis Stream sitting between them:
+
+- **Producer** (`fetch_news.py`): after inserting a genuinely new
+  article, `XADD`s its id to the `new_articles` stream.
+- **Consumer** (`src/streaming/consumer.py`): a worker in a consumer
+  group (`processors`) that `XREADGROUP`s one message at a time, runs
+  NER + classification on it, writes results, then `XACK`s. One at a
+  time deliberately - a stream consumer's job is low latency per item as
+  things arrive, not throughput (that's what the batch scripts and
+  `/classify_batch` are for; see the M4b tradeoff writeup above).
+
+The actual reason to use a durable stream instead of just polling the
+DB: **a crashed worker doesn't lose work.** Verified this directly
+rather than just asserting it:
+
+1. Had a consumer (`crashed-worker`) `XREADGROUP` a message, then exit
+   without acking - simulating a crash mid-processing.
+2. Confirmed via `XPENDING` the message was stuck, owned by the dead
+   consumer, idle and undelivered.
+3. Waited past the 30s idle threshold, then ran a real consumer
+   (`worker-2`). Its `reclaim_stale()` step (`XAUTOCLAIM`) picked up the
+   abandoned message automatically, processed it, and acked it -
+   `XPENDING` went back to 0 and the article got correctly classified.
+
+This is exactly the failure mode a poll-the-database design can't handle
+cleanly without a lot of bespoke locking/retry logic, and it's the kind
+of reliability property the JD's "data integrity" language is pointing
+at, not just "does the model work on the happy path."
+
+Run it (needs `redis-server` running locally):
+```bash
+python -m src.ingest.fetch_news        # producer: publishes new article ids
+python -m src.streaming.consumer worker-1   # consumer: processes them
+```
+
+Known limitations:
+- `XACK` removes a message from the pending list, not from the stream
+  itself - `XLEN` keeps growing forever unless trimmed. A real deployment
+  needs `XTRIM` (by `MAXLEN` or age) on a schedule; not implemented here.
+- Ingestion (`fetch_news.py`) now has a hard dependency on Redis being
+  up - if Redis is down, ingestion fails outright rather than degrading
+  gracefully. A more decoupled design would have ingestion always write
+  to SQLite and a separate lightweight tailer publish to the stream, so
+  ingestion never depends on Redis's uptime. Traded that complexity away
+  here; worth naming as a deliberate simplification, not an oversight.
+- Single consumer process demoed. The consumer-group design means
+  running multiple `worker-N` processes would load-balance the stream
+  across them for free (that's what consumer groups are for), but this
+  wasn't load-tested with more than one.

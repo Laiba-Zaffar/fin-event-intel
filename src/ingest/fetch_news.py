@@ -12,6 +12,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from src.ingest.rss_sources import RSS_FEEDS
 from src.storage.db import get_connection, insert_article
+from src.streaming.config import STREAM_NAME, get_redis_client
 
 
 def parse_published(entry) -> str | None:
@@ -55,16 +56,22 @@ def fetch_feed(source: str, url: str) -> list[dict]:
 
 def run_once() -> None:
     conn = get_connection()
+    redis_client = get_redis_client()
     total_new = 0
 
     for source, url in RSS_FEEDS.items():
         articles = fetch_feed(source, url)
-        new_count = sum(insert_article(conn, a) for a in articles)
-        total_new += new_count
-        print(f"  {source}: {len(articles)} fetched, {new_count} new")
+        new_ids = [insert_article(conn, a) for a in articles]
+        new_ids = [i for i in new_ids if i is not None]
+
+        for article_id in new_ids:
+            redis_client.xadd(STREAM_NAME, {"article_id": article_id})
+
+        total_new += len(new_ids)
+        print(f"  {source}: {len(articles)} fetched, {len(new_ids)} new")
 
     conn.close()
-    print(f"Done. {total_new} new articles stored.")
+    print(f"Done. {total_new} new articles stored and published to '{STREAM_NAME}'.")
 
 
 if __name__ == "__main__":

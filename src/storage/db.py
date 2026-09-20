@@ -51,18 +51,25 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
-def insert_article(conn: sqlite3.Connection, article: dict) -> bool:
+def insert_article(conn: sqlite3.Connection, article: dict) -> int | None:
     try:
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO articles (source, title, link, summary, published_at, fetched_at)
                VALUES (:source, :title, :link, :summary, :published_at, :fetched_at)""",
             article,
         )
         conn.commit()
-        return True
+        return cur.lastrowid
     except sqlite3.IntegrityError:
         # link already seen — RSS feeds repeat entries across polls
-        return False
+        return None
+
+
+def get_article(conn: sqlite3.Connection, article_id: int) -> sqlite3.Row | None:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        "SELECT id, title, summary FROM articles WHERE id = ?", (article_id,)
+    ).fetchone()
 
 
 def get_unprocessed_articles(conn: sqlite3.Connection) -> list[sqlite3.Row]:
